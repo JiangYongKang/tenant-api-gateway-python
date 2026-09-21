@@ -15,6 +15,7 @@ class RejectReason(enum.Enum):
     RATE_LIMITED = "rate_limited"
     QUOTA_EXCEEDED = "quota_exceeded"
     IDEMPOTENCY_CONFLICT = "idempotency_conflict"
+    IDEMPOTENCY_IN_PROGRESS = "idempotency_in_progress"
     DEGRADED = "degraded"
 
 
