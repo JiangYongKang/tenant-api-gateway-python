@@ -204,6 +204,13 @@ class GovernancePipeline:
 
     def _degrade(self, decision: Decision, exc: Exception, now: float) -> Decision:
         logger.exception("governance degraded: %s", exc)
+        # 降级前释放已占用的幂等记录，不留半更新状态
+        if decision.idempotency_key and decision.tenant_id:
+            try:
+                self._idem.abort(decision.tenant_id, decision.idempotency_key)
+            except Exception:
+                logger.exception("idempotency abort during degradation failed")
+            decision.idempotency_key = None
         try:
             mode = self._config.get().degraded_mode
         except Exception:
