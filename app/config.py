@@ -63,6 +63,26 @@ def validate_config(data: dict) -> GovernanceConfig:
     )
 
 
+def validate_policy_fields(data: dict) -> dict:
+    """校验租户级覆盖字段（与全局配置同一套边界），返回规范化后的 dict。"""
+    if not isinstance(data, dict):
+        raise ConfigValidationError(f"策略覆盖必须是 dict，得到 {type(data).__name__}")
+    known = {"rate_limit_per_minute", "quota_per_day", "idempotency_ttl_seconds"}
+    unknown = set(data) - known
+    if unknown:
+        raise ConfigValidationError(f"未知策略项: {sorted(unknown)}")
+    if not data:
+        raise ConfigValidationError("策略覆盖不能为空")
+    out: dict = {}
+    if "rate_limit_per_minute" in data:
+        out["rate_limit_per_minute"] = _check_int("rate_limit_per_minute", data["rate_limit_per_minute"], 1, 1_000_000)
+    if "quota_per_day" in data:
+        out["quota_per_day"] = _check_int("quota_per_day", data["quota_per_day"], 1, 100_000_000)
+    if "idempotency_ttl_seconds" in data:
+        out["idempotency_ttl_seconds"] = _check_float("idempotency_ttl_seconds", data["idempotency_ttl_seconds"], 1.0, 7 * 86_400.0)
+    return out
+
+
 class ConfigStore:
     """持有当前配置；更新时整体校验、原子替换。"""
 

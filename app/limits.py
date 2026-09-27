@@ -44,6 +44,17 @@ class RateLimiter:
             self._evict_if_needed()
             return decision
 
+    def peek(self, tenant_id: str, per_minute: int, now: float) -> LimitDecision:
+        """只读观察当前额度，不消耗令牌；用于用量视图，与 check 同一把锁保证自洽。"""
+        rate = per_minute / 60.0
+        with self._lock:
+            tokens, last = self._buckets.get(tenant_id, (float(per_minute), now))
+            tokens = min(float(per_minute), tokens + max(0.0, now - last) * rate)
+            if tokens >= 1.0:
+                return LimitDecision(True, tokens, None)
+            wait = (1.0 - tokens) / rate
+            return LimitDecision(False, tokens, math.ceil(wait * 1000) / 1000)
+
     def _evict_if_needed(self) -> None:
         if len(self._buckets) <= self._max_tenants:
             return
@@ -80,6 +91,10 @@ class QuotaTracker:
     def usage(self, tenant_id: str, now: float) -> int:
         with self._lock:
             return self._counts.get((tenant_id, self.window_of(now)), 0)
+
+    def reset_seconds(self, now: float) -> float:
+        """当前窗口距离重置的秒数（窗口对齐 Unix 日界，确定）。"""
+        return max(round((self.window_of(now) + 1) * DAY_SECONDS - now, 3), 0.0)
 
     def _sweep(self, current_window: int) -> None:
         # 回收历史窗口；窗口判定只依赖时间，回收不影响当前窗口结果

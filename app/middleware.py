@@ -23,8 +23,9 @@ from .audit import AuditLog, AuditOutcome, AuditRecord
 from .config import ConfigStore
 from .idempotency import BeginResult, IdempotencyStore
 from .limits import QuotaTracker, RateLimiter
+from .overrides import TenantPolicyStore
 from .state import StateBackend, StateUnavailableError
-from .tenancy import TenantResolver, TenancyError
+from .tenancy import CredentialRejectReason, TenantResolver, TenancyError
 
 REQUEST_ID_HEADER = "x-request-id"
 IDEMPOTENCY_HEADER = "idempotency-key"
@@ -44,6 +45,7 @@ class GovernanceMiddleware:
         idempotency_store: IdempotencyStore,
         audit_log: AuditLog,
         state_backend: StateBackend,
+        policy_store: TenantPolicyStore | None = None,
         clock: Callable[[], float] = time.time,
         state_timeout: float = DEFAULT_STATE_TIMEOUT,
         exempt_paths: tuple[str, ...] = ("/admin/", "/healthz"),
@@ -56,6 +58,7 @@ class GovernanceMiddleware:
         self.idempotency_store = idempotency_store
         self.audit_log = audit_log
         self.state_backend = state_backend
+        self.policy_store = policy_store
         self.clock = clock
         self.state_timeout = state_timeout
         self.exempt_paths = exempt_paths
@@ -95,19 +98,31 @@ class GovernanceMiddleware:
         try:
             tenant = self.resolver.resolve(headers)
         except TenancyError as e:
-            await self._reject(send, request_id, 401, e.reason.value)
-            self._audit(request_id, None, method, path, AuditOutcome.REJECTED, e.reason.value, 401, now)
+            # 过渡态（draining）与"凭据无效""已停用"可区分：403 tenant_draining
+            status = 403 if e.reason is CredentialRejectReason.TENANT_DRAINING else 401
+            await self._reject(send, request_id, status, e.reason.value)
+            self._audit(request_id, None, method, path, AuditOutcome.REJECTED, e.reason.value, status, now)
             return
 
+        # 2.5 该租户的生效策略：专属覆盖逐字段覆盖全局默认，仅作用于本租户
+        policy = (
+            self.policy_store.effective_for(tenant.tenant_id, cfg)
+            if self.policy_store is not None
+            else None
+        )
+        rate_per_minute = policy.rate_limit_per_minute if policy else cfg.rate_limit_per_minute
+        quota_per_day = policy.quota_per_day if policy else cfg.quota_per_day
+        idem_ttl = policy.idempotency_ttl_seconds if policy else cfg.idempotency_ttl_seconds
+
         # 3. 限流（速率）
-        rate = self.rate_limiter.check(tenant.tenant_id, cfg.rate_limit_per_minute, now)
+        rate = self.rate_limiter.check(tenant.tenant_id, rate_per_minute, now)
         if not rate.allowed:
             await self._reject(send, request_id, 429, "rate_limited", retry_after=rate.retry_after_seconds)
             self._audit(request_id, tenant.tenant_id, method, path, AuditOutcome.REJECTED, "rate_limited", 429, now)
             return
 
         # 4. 配额（累计用量）；限流未通过时不会走到这里，不会误扣
-        quota = self.quota_tracker.consume(tenant.tenant_id, cfg.quota_per_day, now)
+        quota = self.quota_tracker.consume(tenant.tenant_id, quota_per_day, now)
         if not quota.allowed:
             await self._reject(send, request_id, 429, "quota_exceeded", retry_after=quota.retry_after_seconds)
             self._audit(request_id, tenant.tenant_id, method, path, AuditOutcome.REJECTED, "quota_exceeded", 429, now)
@@ -115,11 +130,12 @@ class GovernanceMiddleware:
 
         # 5. 幂等（仅副作用方法且携带标识）
         idem_key = headers.get(IDEMPOTENCY_HEADER)
+        idem_pending: tuple[str, str] | None = None
         body = b""
         if method in SIDE_EFFECT_METHODS and idem_key:
             body, receive = await self._buffer_body(receive)
             fingerprint = hashlib.sha256(method.encode() + b"|" + path.encode() + b"|" + body).hexdigest()
-            outcome = self.idempotency_store.begin(tenant.tenant_id, idem_key, fingerprint, cfg.idempotency_ttl_seconds, now)
+            outcome = self.idempotency_store.begin(tenant.tenant_id, idem_key, fingerprint, idem_ttl, now)
             if outcome.result is BeginResult.CONFLICT:
                 await self._reject(send, request_id, 409, "idempotency_conflict")
                 self._audit(request_id, tenant.tenant_id, method, path, AuditOutcome.REJECTED, "idempotency_conflict", 409, now)
@@ -134,10 +150,16 @@ class GovernanceMiddleware:
                 self._audit(request_id, tenant.tenant_id, method, path, AuditOutcome.REPLAYED, "idempotent_replay", status, now)
                 return
             # NEW：包装 send 以捕获响应，完成后落缓存
+            idem_pending = (tenant.tenant_id, idem_key)
             send = self._capturing_send(send, tenant.tenant_id, idem_key, now)
 
-        # 6. 下游处理（注入贯穿标识）
-        await self.app(scope, receive, self._request_id_send(send, request_id))
+        # 6. 下游处理（注入贯穿标识）；下游异常时释放处理中幂等记录，合法重试可重新推进
+        try:
+            await self.app(scope, receive, self._request_id_send(send, request_id))
+        except Exception:
+            if idem_pending is not None:
+                self.idempotency_store.abort(*idem_pending)
+            raise
         self._audit(request_id, tenant.tenant_id, method, path, AuditOutcome.PROCESSED, None, 200, now)
 
     def _request_id_send(self, send: Send, request_id: str) -> Send:
@@ -196,7 +218,11 @@ class GovernanceMiddleware:
                 captured["chunks"].append(message.get("body", b""))
                 if not message.get("more_body"):
                     status = int(captured["status"] or 500)
-                    self.idempotency_store.complete(tenant_id, key, status, b"".join(captured["chunks"]), self.clock())
+                    if status < 500:
+                        self.idempotency_store.complete(tenant_id, key, status, b"".join(captured["chunks"]), self.clock())
+                    else:
+                        # 下游 5xx 不落缓存：释放记录，同标识合法重试可重新推进
+                        self.idempotency_store.abort(tenant_id, key)
             await send(message)
 
         return wrapped
