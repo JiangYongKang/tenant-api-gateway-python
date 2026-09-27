@@ -24,10 +24,46 @@ uv run pytest tests -q        # 运行全部自动化测试
 | `malformed_credential` | 格式非法 |
 | `legacy_format` | 历史形态 `tenant-<id>`，确定性拒绝（兼容策略：明确拒绝而非猜测） |
 | `unknown_tenant` | 租户不存在 |
-| `bad_signature` | 签名校验失败 |
-| `tenant_disabled` | 租户已停用 |
+| `bad_signature` | 签名校验失败（含凭据换发后的旧凭据） |
+| `tenant_suspended` | 租户被临时停用（HTTP 401） |
+| `tenant_draining` | 租户处于平滑下线过渡态（HTTP 403，与凭据无效/已停用都不同） |
+| `tenant_disabled` | 租户已停用（终态） |
 
 不同租户的计量、幂等记录与审计完全隔离，互不可见、互不影响。
+
+## 租户在线生命周期
+
+通过 `POST /admin/tenants` 在线维护租户（不必重启），请求体为
+`{"operations": [...]}` 的批量操作，**整体校验、原子生效**：任一操作非法或互相冲突，
+整批返回 HTTP 422 `invalid_tenant_batch`，注册表完全不变，绝不静默退回旧值或部分应用。
+
+生命周期状态机：
+
+```
+provision → ACTIVE --suspend--> SUSPENDED --resume--> ACTIVE
+           ACTIVE/SUSPENDED --decommission(drain_seconds)--> DRAINING --过渡期满--> DISABLED(终态)
+```
+
+| 状态 | 含义 | 对新请求 | 在途请求 |
+|---|---|---|---|
+| `active` | 正常服务 | 正常治理 | 正常 |
+| `suspended` | 临时停用，可 `resume` 恢复 | 401 `tenant_suspended` | 已通过的请求正常收尾 |
+| `draining` | 平滑下线过渡态 | 403 `tenant_draining`（明确区别于凭据无效与已停用） | 正常收尾 |
+| `disabled` | 终态（过渡期满自动迁移） | 401 `tenant_disabled` | — |
+
+操作类型：`provision`（开通，响应含新凭据）、`rotate_credential`（换发：凭据世代 +1，
+旧凭据立即以 `bad_signature` 失效，响应含新凭据）、`suspend`、`resume`、
+`decommission`（`drain_seconds` 后可真正停用，0 表示立即）。
+
+拒绝条件（均 422 且整批不生效）：租户已存在/不存在、状态机不允许的迁移、
+同一租户在一批中出现多次（互相冲突）、`drain_seconds` 越界（0~7 天）或类型错误、
+未知操作、非法租户名、空批次、注册表已满且无可回收条目。
+
+一致性：单请求在入口完成一次身份判定后持有该结论快照，变更不改写在途请求；
+`authenticate` 在锁内原子完成 存在性+签名+状态 判定，并发变更下结论不自相矛盾。
+
+有界可回收：注册表容量有上限（`max_tenants`），满员时优先回收终态
+（含过渡期满的 DRAINING）租户，无回收空间则明确拒绝新开通。
 
 ## 限流与配额语义
 
@@ -84,6 +120,44 @@ uv run pytest tests -q        # 运行全部自动化测试
 非法配置（未知项、错误类型、越界取值）返回 HTTP 422 `invalid_config`，
 旧配置原样保留，绝不静默回退默认值。
 
+## 租户差异化策略
+
+通过 `PUT /admin/policies/{tenant_id}` 为单个租户覆盖治理参数，
+`DELETE /admin/policies/{tenant_id}` 移除覆盖，`GET /admin/policies` 查看清单。
+
+- 可覆盖字段：`rate_limit_per_minute`、`quota_per_day`、`idempotency_ttl_seconds`；
+  `state_failure_mode` 是全局开关，**不可**按租户覆盖。
+- 优先级（唯一且可解释）：**逐字段合并 —— 租户覆盖值 > 全局默认值**；
+  未覆盖的字段继续跟随全局配置（含全局配置的后续调整）。作用范围仅限该租户。
+- 生效时机：写入成功后立即影响该租户的后续请求；单请求内使用同一份生效快照。
+- 拒绝条件（HTTP 422 `invalid_policy`，原策略原样保留）：未知或不可覆盖字段、
+  类型错误（含 bool 冒充整数）、越界取值（边界与全局配置一致）、空覆盖、
+  覆盖条目数超上限；对不存在的租户返回 404 `unknown_tenant`。
+
+## 租户用量视图
+
+`GET /admin/usage/{tenant_id}`（只读，不消耗任何额度）：
+
+| 字段 | 含义 |
+|---|---|
+| `rate_limit.limit_per_minute` | 生效的速率上限（含租户覆盖） |
+| `rate_limit.remaining` | 当前剩余速率额度（令牌数，向下保留两位小数） |
+| `rate_limit.retry_after_seconds` | 额度耗尽时预计恢复秒数；未耗尽为 `null` |
+| `quota.limit_per_day` / `used` / `remaining` | 本周期累计额度上限 / 已用 / 剩余 |
+| `quota.reset_at` | 当前配额窗口重置时刻（Unix 秒） |
+| `idempotency.records` | 该租户当前占用（未过期）的重放记录数 |
+| `idempotency.ttl_seconds` | 生效的重放记录有效期 |
+| `policy.overridden_fields` | 该租户生效的覆盖项；空对象表示全部走全局默认 |
+
+自洽性：各组件在各自锁内取快照，并发查询下 `used ≤ limit`、
+`used + remaining = limit` 恒成立；视图只含该租户聚合数字，
+**不含凭据明文与其他租户信息**。
+
+降级表现：治理状态读不到或读取超时（与中间件同一判定路径与超时预算）时，
+返回 HTTP 503 `state_unavailable` —— 明确、可观测、可用
+`StateBackend.set_failure()/set_latency()` 本地复现；内部异常细节不外透。
+租户不存在返回 404 `unknown_tenant`。
+
 ## 验证方法
 
 ```bash
@@ -97,16 +171,24 @@ uv run pytest tests -q
 - `tests/test_idempotency.py`：重放/冲突/处理中区分、TTL 过期、并发单次副作用；
 - `tests/test_degradation.py`：故障与慢响应降级、两种模式、恢复后状态完整；
 - `tests/test_config_api.py`：非法配置拒绝、即时生效、快照一致性；
-- `tests/test_audit.py`：四类结局可检索、贯穿标识、无敏感信息、HTTP 级并发幂等。
+- `tests/test_audit.py`：四类结局可检索、贯穿标识、无敏感信息、HTTP 级并发幂等；
+- `tests/test_tenant_admin.py`：租户在线生命周期、原子批量拒绝、并发变更一致性、有界回收；
+- `tests/test_policies.py`：差异策略优先级、非法拒绝并保留原策略、只影响本租户；
+- `tests/test_usage.py`：用量视图字段、并发自洽、降级可观测、无凭据/跨租户泄露；
+- `tests/test_idempotency_retry.py`：下游失败/降级后同标识重试可重新推进；
+- `tests/test_open_entries.py`：开放入口无凭据可访问、响应形态不回归。
 
 ## 目录结构
 
 ```
 main.py            # 装配与业务/管理接口
-app/tenancy.py     # 租户身份解析与校验
+app/tenancy.py     # 租户身份解析、校验与在线生命周期（原子批量变更、有界注册表）
 app/config.py      # 治理配置：强校验、原子生效
-app/limits.py      # 限流（令牌桶）与配额（固定窗口）
-app/idempotency.py # 幂等记录存储
+app/policies.py    # 租户差异化策略（覆盖全局默认）
+app/usage.py       # 租户用量视图（只读快照、降级可观测）
+app/admin.py       # 治理管理接口（/admin/tenants、/admin/policies、/admin/usage）
+app/limits.py      # 限流（令牌桶）与配额（固定窗口），含只读快照
+app/idempotency.py # 幂等记录存储（下游失败可放弃记录，重试不被占住）
 app/audit.py       # 审计日志
 app/state.py       # 治理运行状态后端（故障/延迟注入）
 app/middleware.py  # 治理编排中间件

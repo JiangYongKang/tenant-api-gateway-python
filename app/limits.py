@@ -51,6 +51,20 @@ class RateLimiter:
         for victim in sorted(self._buckets, key=lambda t: self._buckets[t][1])[: len(self._buckets) - self._max_tenants]:
             del self._buckets[victim]
 
+    def inspect(self, tenant_id: str, per_minute: int, now: float) -> LimitDecision:
+        """只读快照（不消耗令牌）：剩余额度与预计恢复秒数，供用量视图使用。
+
+        与 check 同一把锁内惰性补充后读取，并发下与扣减结果自洽。
+        """
+        rate = per_minute / 60.0
+        with self._lock:
+            tokens, last = self._buckets.get(tenant_id, (float(per_minute), now))
+            tokens = min(float(per_minute), tokens + max(0.0, now - last) * rate)
+            if tokens >= 1.0:
+                return LimitDecision(True, tokens, None)
+            wait = (1.0 - tokens) / rate
+            return LimitDecision(False, tokens, math.ceil(wait * 1000) / 1000)
+
 
 class QuotaTracker:
     """每租户每窗口一个计数器；窗口 = floor(now / DAY_SECONDS)。"""
@@ -80,6 +94,18 @@ class QuotaTracker:
     def usage(self, tenant_id: str, now: float) -> int:
         with self._lock:
             return self._counts.get((tenant_id, self.window_of(now)), 0)
+
+    def inspect(self, tenant_id: str, per_day: int, now: float) -> dict:
+        """只读快照：已用/剩余/窗口重置时刻，供用量视图使用（锁内读取，并发自洽）。"""
+        window = self.window_of(now)
+        with self._lock:
+            used = self._counts.get((tenant_id, window), 0)
+        return {
+            "used": used,
+            "limit": per_day,
+            "remaining": max(per_day - used, 0),
+            "reset_at": (window + 1) * DAY_SECONDS,
+        }
 
     def _sweep(self, current_window: int) -> None:
         # 回收历史窗口；窗口判定只依赖时间，回收不影响当前窗口结果

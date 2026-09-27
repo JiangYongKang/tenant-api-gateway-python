@@ -62,6 +62,21 @@ class IdempotencyStore:
             if rec is not None and rec.expires_at > now and rec.tenant_id == tenant_id:
                 rec.response = (status, body)
 
+    def abandon(self, tenant_id: str, key: str) -> None:
+        """下游失败时放弃处理中记录：同标识的合法重试可重新推进，不被长期占住。"""
+        map_key = (tenant_id, key)
+        with self._lock:
+            rec = self._records.get(map_key)
+            # 只放弃仍处理中的记录；已完成的记录（含并发完成的合法结果）不动
+            if rec is not None and rec.response is None and rec.tenant_id == tenant_id:
+                del self._records[map_key]
+
+    def usage(self, tenant_id: str, now: float) -> int:
+        """该租户当前占用（未过期）的重放记录数，用于用量视图。"""
+        with self._lock:
+            self._sweep(now)
+            return sum(1 for r in self._records.values() if r.tenant_id == tenant_id)
+
     def size(self) -> int:
         with self._lock:
             return len(self._records)

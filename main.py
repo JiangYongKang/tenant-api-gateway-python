@@ -2,13 +2,18 @@
 
 - GET  /                原有接口，语义不变（需有效租户凭据）
 - POST /orders          演示副作用接口（每租户计数），支持 Idempotency-Key
+- GET  /healthz           对外开放的健康检查（豁免治理，无凭据可访问）
 - GET  /admin/config    查看当前治理配置
 - POST /admin/config    调整治理配置（强校验，非法即 422，即时生效）
 - GET  /admin/audit     检索审计记录
+- /admin/tenants/*      租户在线生命周期（开通/换发/停用/平滑下线，原子生效）
+- /admin/policies/*     租户差异化策略（覆盖全局默认，非法即 422）
+- GET  /admin/usage/{id} 租户用量视图（降级时 503 state_unavailable）
 """
 from __future__ import annotations
 
 import threading
+import time
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -17,7 +22,9 @@ from app.audit import AuditLog, AuditOutcome
 from app.config import ConfigStore, ConfigValidationError
 from app.idempotency import IdempotencyStore
 from app.limits import QuotaTracker, RateLimiter
+from app.admin import register_admin_routes
 from app.middleware import GovernanceMiddleware
+from app.policies import PolicyStore
 from app.state import StateBackend
 from app.tenancy import TenantRegistry, TenantResolver, TenantStatus
 
@@ -33,6 +40,7 @@ state_backend = StateBackend()
 rate_limiter = RateLimiter()
 quota_tracker = QuotaTracker()
 idempotency_store = IdempotencyStore()
+policy_store = PolicyStore()
 resolver = TenantResolver(registry)
 
 app = FastAPI(title="tenant-api-gateway")
@@ -45,6 +53,7 @@ app.add_middleware(
     idempotency_store=idempotency_store,
     audit_log=audit_log,
     state_backend=state_backend,
+    policy_store=policy_store,
 )
 
 # ---- 业务接口 ----
@@ -57,6 +66,12 @@ def read_root():
     return {"Hello": "World"}
 
 
+@app.get("/healthz")
+def healthz():
+    # 对外开放的入口：豁免治理链路，无凭据可访问
+    return {"status": "ok"}
+
+
 @app.post("/orders", status_code=201)
 async def create_order(request: Request):
     tenant = request.headers.get("x-tenant-credential", "").split(".")[0].removeprefix("tnt_")
@@ -64,6 +79,20 @@ async def create_order(request: Request):
         _order_counters[tenant] = _order_counters.get(tenant, 0) + 1
         count = _order_counters[tenant]
     return {"order_seq": count, "tenant": tenant}
+
+
+register_admin_routes(
+    app,
+    registry=registry,
+    config_store=config_store,
+    policy_store=policy_store,
+    rate_limiter=rate_limiter,
+    quota_tracker=quota_tracker,
+    idempotency_store=idempotency_store,
+    state_backend=state_backend,
+    clock=time.time,
+    state_timeout=0.5,
+)
 
 
 # ---- 治理管理接口（豁免治理链路，保证降级期间仍可调配置） ----
