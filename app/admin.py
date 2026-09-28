@@ -1,6 +1,7 @@
 """治理管理接口（/admin/*，豁免治理链路，降级期间仍可操作）。
 
-- POST /admin/tenants            租户在线生命周期：原子批量变更，非法/冲突整批 422
+- POST /admin/tenants            租户在线生命周期：原子批量变更，非法整批 422 invalid_tenant_batch，
+                                 并发冲突整批 422 tenant_batch_conflict；两种拒绝均零改动
 - GET  /admin/tenants[/{id}]     租户清单/详情（状态可见，不含凭据）
 - PUT  /admin/policies/{id}      设置租户差异化策略（整体校验，非法 422 保留原策略）
 - DELETE /admin/policies/{id}    移除覆盖，回落全局默认
@@ -19,7 +20,7 @@ from .idempotency import IdempotencyStore
 from .limits import QuotaTracker, RateLimiter
 from .policies import PolicyStore, PolicyValidationError
 from .state import StateBackend, StateUnavailableError
-from .tenancy import TenantAdminError, TenantRegistry
+from .tenancy import TenantAdminError, TenantBatchConflictError, TenantRegistry
 from .usage import build_usage_view
 
 
@@ -50,6 +51,9 @@ def register_admin_routes(
         operations = body.get("operations") if isinstance(body, dict) else None
         try:
             results = registry.apply_batch(operations)
+        except TenantBatchConflictError as e:
+            # 并发冲突：整批拒绝、零改动（不 bump 版本），调用方可整批重试
+            return _error(422, "tenant_batch_conflict", e.errors)
         except TenantAdminError as e:
             return _error(422, "invalid_tenant_batch", e.errors)
         state_backend.bump_revision()
