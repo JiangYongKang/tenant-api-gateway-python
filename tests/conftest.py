@@ -55,12 +55,24 @@ class Harness:
         return {"x-tenant-credential": self.cred(tenant_id), **extra}
 
 
-def build_harness() -> Harness:
+def build_harness(
+    max_tenants: int = 10_000,
+    *,
+    seed_disabled: bool = True,
+    seeds: dict[str, TenantStatus] | None = None,
+) -> Harness:
     clock = MutableClock()
-    registry = TenantRegistry(secret=b"test-secret", clock=clock)
-    registry.add("acme")
-    registry.add("globex")
-    registry.add("oldco", TenantStatus.DISABLED)
+    # 本地把容量上限调小即可稳定复现"容量超限导致整批拒绝"
+    registry = TenantRegistry(secret=b"test-secret", clock=clock, max_tenants=max_tenants)
+    if seeds is not None:
+        for tid, status in seeds.items():  # 显式种子：用于精确构造容量/回收场景
+            registry.add(tid, status)
+    else:
+        registry.add("acme")
+        registry.add("globex")
+        if seed_disabled:
+            # 可回收终态租户；零回收空间的场景用 seed_disabled=False 且容量=2
+            registry.add("oldco", TenantStatus.DISABLED)
 
     config_store = ConfigStore()
     audit_log = AuditLog()
@@ -146,3 +158,20 @@ def build_harness() -> Harness:
 @pytest.fixture()
 def harness() -> Harness:
     return build_harness()
+
+
+@pytest.fixture()
+def small_harness() -> Harness:
+    # 容量=2，两个种子（acme/globex）均为 ACTIVE、无可回收终态：
+    # 任何新增开通都稳定触发容量上限，且不存在靠回收"意外成功"的干扰。
+    return build_harness(max_tenants=2, seed_disabled=False)
+
+
+@pytest.fixture()
+def reclaim_harness() -> Harness:
+    # 容量=2：1 个 ACTIVE（acme）+ 1 个立即到期的终态（gone DISABLED，可回收腾 1 个位）。
+    # 并发批量开通时恰好一个批次能靠回收整体成功，其余批次在应用阶段才撞上容量。
+    return build_harness(
+        max_tenants=2,
+        seeds={"acme": TenantStatus.ACTIVE, "gone": TenantStatus.DISABLED},
+    )

@@ -37,6 +37,34 @@ uv run pytest tests -q        # 运行全部自动化测试
 `{"operations": [...]}` 的批量操作，**整体校验、原子生效**：任一操作非法或互相冲突，
 整批返回 HTTP 422 `invalid_tenant_batch`，注册表完全不变，绝不静默退回旧值或部分应用。
 
+### 批量变更的整体成功 / 整体失败语义
+
+一批操作是一个不可分割的事务，调用方只能观察到两种结果之一：
+
+- **整体成功**（HTTP 200，`applied: true`）：批次中每一条都生效，返回每条结果
+  （`provision`/`rotate_credential` 含新凭据）；
+- **整体失败**（HTTP 422，`invalid_tenant_batch`）：**零改动、零痕迹**，如同该批次从未提交。
+
+实现上，`TenantRegistry.apply_batch` 在注册表锁内先把整批（含前置校验、容量回收判定、
+状态机预演）跑在一份**暂存副本**上；任何一条目产生错误（包括只有在"应用时"才能确定的
+失败，例如**租户数量已达 `max_tenants` 容量上限且无可回收终态租户、新增租户开不出来**）
+都直接丢弃暂存副本并拒绝整批，真实注册表（租户清单、单个租户状态、凭据世代、到期时刻）
+在此之前绝不被触碰；全部条目通过后才以一次引用替换原子提交。因此：
+
+- 批次中排在前面的 `rotate_credential`（换发）不会因为后面某条失败而"提前生效"：
+  整批被拒时旧凭据**当场仍然有效**，不会出现用户拿旧凭据访问被 `bad_signature` 拒绝；
+- 不会新建半成品租户，也不会残留被占用的容量/状态；
+- 租户清单、单个租户详情与凭据在拒绝后与提交前**逐项一致**，成功后才是完整的新状态；
+- 同一批次中重复针对同一租户、`drain_seconds` 越界或类型错误、未知操作、非法租户名、
+  空批次、状态机不允许的迁移等，同样整批拒绝且零改动。
+
+### 并发冲突批次
+
+`apply_batch` 全程持有注册表锁（校验与提交是同一个临界区），多个互相冲突的批次并发
+提交时按全序串行判定：**最后只有一个批次整体生效**，其余批次看到获胜批次提交后的状态，
+因前置条件不再成立（状态已变、租户已存在、容量已被占满等）而**整批 422 拒绝且不留任何
+痕迹**——不会在拒绝后残留半成品改动（如被多推进的凭据世代），也不会留下被占住的状态。
+
 生命周期状态机：
 
 ```
@@ -55,9 +83,11 @@ provision → ACTIVE --suspend--> SUSPENDED --resume--> ACTIVE
 旧凭据立即以 `bad_signature` 失效，响应含新凭据）、`suspend`、`resume`、
 `decommission`（`drain_seconds` 后可真正停用，0 表示立即）。
 
-拒绝条件（均 422 且整批不生效）：租户已存在/不存在、状态机不允许的迁移、
+拒绝条件（均 422 且整批不生效、零改动）：租户已存在/不存在、状态机不允许的迁移、
 同一租户在一批中出现多次（互相冲突）、`drain_seconds` 越界（0~7 天）或类型错误、
-未知操作、非法租户名、空批次、注册表已满且无可回收条目。
+未知操作、非法租户名、空批次、**注册表已满（达到 `max_tenants` 容量上限）且回收终态
+租户后仍无空间**——容量判定在提交前的暂存校验阶段完成，因此即使超限的开通排在批次
+末尾，也不会让前面的换发/停用等操作部分生效。
 
 一致性：单请求在入口完成一次身份判定后持有该结论快照，变更不改写在途请求；
 `authenticate` 在锁内原子完成 存在性+签名+状态 判定，并发变更下结论不自相矛盾。
@@ -172,11 +202,55 @@ uv run pytest tests -q
 - `tests/test_degradation.py`：故障与慢响应降级、两种模式、恢复后状态完整；
 - `tests/test_config_api.py`：非法配置拒绝、即时生效、快照一致性；
 - `tests/test_audit.py`：四类结局可检索、贯穿标识、无敏感信息、HTTP 级并发幂等；
-- `tests/test_tenant_admin.py`：租户在线生命周期、原子批量拒绝、并发变更一致性、有界回收；
+- `tests/test_tenant_admin.py`：租户在线生命周期、**批量整体成功/整体失败（含容量超限
+  零改动、凭据不残留）、并发冲突批次只有一个整体生效**、有界回收；
 - `tests/test_policies.py`：差异策略优先级、非法拒绝并保留原策略、只影响本租户；
 - `tests/test_usage.py`：用量视图字段、并发自洽、降级可观测、无凭据/跨租户泄露；
 - `tests/test_idempotency_retry.py`：下游失败/降级后同标识重试可重新推进；
 - `tests/test_open_entries.py`：开放入口无凭据可访问、响应形态不回归。
+
+### 本地复现"容量超限导致整批拒绝、状态与凭据完全不变"
+
+把注册表容量上限调小即可稳定复现（无需外部依赖）。`tests/conftest.py` 的
+`build_harness(max_tenants=..., seeds=...)` 支持以小容量装配：
+
+- `small_harness`（容量 2，两个 ACTIVE 种子、无可回收终态）：任何新增开通都触发容量
+  上限。提交 `[换发 acme, 开通 newco]` 时整批 422，断言租户清单/详情/凭据签名逐项
+  不变、旧凭据当场仍可用（`test_capacity_rejection_leaves_credentials_and_state_untouched`）；
+- 不经过 HTTP 的确定性复现见 `test_registry_capacity_rejection_is_all_or_nothing`：
+  `TenantRegistry(secret=b"s", max_tenants=2)` 加两个租户后提交"换发 + 超限开通"。
+
+并发冲突批次见 `test_concurrent_identical_multiop_batches_exactly_one_applies`
+（同一多操作批次并发，只有一个整体生效）与
+`test_concurrent_capacity_race_losing_batches_leave_no_credential_trace`
+（容量 2：1 ACTIVE + 1 可回收 DISABLED，多批"换发 + 唯一开通"竞争唯一空位；
+被拒批次不推进凭据世代，世代恰好为 1）。
+
+也可以直接用一段脚本观察修复前后差异：
+
+```python
+from app.tenancy import TenantRegistry, TenantAdminError, TenantResolver
+
+reg = TenantRegistry(secret=b"s", max_tenants=2)
+reg.add("aa"); reg.add("bb")
+old_cred = reg.issue("aa")
+try:
+    reg.apply_batch([
+        {"op": "rotate_credential", "tenant_id": "aa"},  # 排在前面
+        {"op": "provision", "tenant_id": "cc"},          # 容量超限，整批开不出来
+    ])
+except TenantAdminError as e:
+    print("rejected:", e.errors)
+# 正确行为：整批拒绝后 old_cred 仍然有效（而非 bad_signature）
+TenantResolver(reg).resolve({"x-tenant-credential": old_cred})
+```
+
+可重复运行以确认并发用例稳定（无调度依赖）：
+
+```bash
+uv run pytest tests/test_tenant_admin.py -q -k "concurrent or capacity"
+for i in $(seq 1 20); do uv run pytest tests/test_tenant_admin.py -q -k concurrent; done
+```
 
 ## 目录结构
 

@@ -164,17 +164,27 @@ class TenantRegistry:
 
     # ---- 在线生命周期：原子批量变更 ----
     def apply_batch(self, operations: list[dict]) -> list[dict]:
-        """整体校验后原子应用；任一操作非法/冲突则整批拒绝并抛 TenantAdminError。
+        """整体校验后原子应用；任一操作非法/冲突（含容量不足）则整批拒绝并抛 TenantAdminError。
+
+        校验与"预演"全部在注册表的暂存副本上完成：提交前真实记录（状态、凭据世代、
+        租户清单，连同惰性状态迁移）绝不被触碰。任一条目产生错误即整批放弃暂存副本，
+        调用方观察到的注册表与提交前逐项一致；全部通过后才以单次引用替换原子提交。
 
         返回每个操作的结果（provision/rotate_credential 含新凭据，供下发）。
         """
         with self._lock:
+            if not isinstance(operations, list) or not operations:
+                raise TenantAdminError(["operations: 必须是非空列表"])
+
             now = self._clock()
             errors: list[str] = []
             seen: set[str] = set()
-
-            if not isinstance(operations, list) or not operations:
-                raise TenantAdminError(["operations: 必须是非空列表"])
+            # 暂存副本：整批的校验/预演（含容量回收、惰性到期迁移）只落在这里
+            stage: dict[str, _TenantRecord] = {
+                tid: _TenantRecord(rec.tenant_id, rec.status, rec.generation, rec.drain_until)
+                for tid, rec in self._records.items()
+            }
+            results: list[dict] = []
 
             for i, op in enumerate(operations):
                 if not isinstance(op, dict):
@@ -192,68 +202,81 @@ class TenantRegistry:
                     errors.append(f"operations[{i}]: 同一租户 {tenant_id!r} 在一批中只能出现一次（互相冲突）")
                     continue
                 seen.add(tenant_id)
-                rec = self._records.get(tenant_id)
+                rec = stage.get(tenant_id)
                 status = self._effective_status(rec) if rec else None
 
+                # ---- 前置校验：任何一条不过都只记错，绝不改动暂存副本 ----
                 if action == "provision":
                     if rec is not None:
                         errors.append(f"operations[{i}]: 租户 {tenant_id!r} 已存在")
+                        continue
+                    # 容量判定前移到校验阶段：满员且回收后仍不足时整批不可行
+                    self._reclaim_disabled_if_full(stage)
+                    if len(stage) >= self._max_tenants:
+                        errors.append(f"operations[{i}]: 注册表已满（{self._max_tenants}）且无可回收租户")
+                        continue
                 elif action == "rotate_credential":
                     if rec is None:
                         errors.append(f"operations[{i}]: 租户 {tenant_id!r} 不存在")
+                        continue
                 elif action == "suspend":
                     if status is not TenantStatus.ACTIVE:
                         errors.append(f"operations[{i}]: suspend 要求 ACTIVE，当前 {status.value if status else '不存在'}")
+                        continue
                 elif action == "resume":
                     if status is not TenantStatus.SUSPENDED:
                         errors.append(f"operations[{i}]: resume 要求 SUSPENDED，当前 {status.value if status else '不存在'}")
+                        continue
                 elif action == "decommission":
-                    if status not in (TenantStatus.ACTIVE, TenantStatus.SUSPENDED):
-                        errors.append(f"operations[{i}]: decommission 要求 ACTIVE/SUSPENDED，当前 {status.value if status else '不存在'}")
                     drain = op.get("drain_seconds", 60.0)
-                    if isinstance(drain, bool) or not isinstance(drain, (int, float)) or not (0.0 <= float(drain) <= MAX_DRAIN_SECONDS):
+                    bad_status = status not in (TenantStatus.ACTIVE, TenantStatus.SUSPENDED)
+                    bad_drain = (
+                        isinstance(drain, bool)
+                        or not isinstance(drain, (int, float))
+                        or not (0.0 <= float(drain) <= MAX_DRAIN_SECONDS)
+                    )
+                    if bad_status:
+                        errors.append(f"operations[{i}]: decommission 要求 ACTIVE/SUSPENDED，当前 {status.value if status else '不存在'}")
+                    if bad_drain:
                         errors.append(f"operations[{i}]: drain_seconds 越界 [0, {MAX_DRAIN_SECONDS}]: {drain!r}")
+                    if bad_status or bad_drain:
+                        continue
 
-            if errors:
-                raise TenantAdminError(errors)
-
-            # 校验全部通过：原子应用（此前注册表未被触碰）
-            results: list[dict] = []
-            for op in operations:
-                action, tenant_id = op["op"], op["tenant_id"]
+                # ---- 该条目通过：只在暂存副本上预演并同步生成结果 ----
                 if action == "provision":
-                    self._reclaim_if_full()
-                    if len(self._records) >= self._max_tenants:
-                        raise TenantAdminError([f"注册表已满（{self._max_tenants}）且无可回收租户"])
-                    self._records[tenant_id] = _TenantRecord(tenant_id, TenantStatus.ACTIVE)
+                    stage[tenant_id] = _TenantRecord(tenant_id, TenantStatus.ACTIVE)
                     results.append({"op": action, "tenant_id": tenant_id, "status": TenantStatus.ACTIVE.value,
                                     "credential": f"tnt_{tenant_id}.{self._signature(tenant_id, 0)}"})
                 elif action == "rotate_credential":
-                    rec = self._records[tenant_id]
                     rec.generation += 1
                     results.append({"op": action, "tenant_id": tenant_id, "generation": rec.generation,
                                     "credential": f"tnt_{tenant_id}.{self._signature(tenant_id, rec.generation)}"})
                 elif action == "suspend":
-                    self._records[tenant_id].status = TenantStatus.SUSPENDED
+                    rec.status = TenantStatus.SUSPENDED
                     results.append({"op": action, "tenant_id": tenant_id, "status": TenantStatus.SUSPENDED.value})
                 elif action == "resume":
-                    self._records[tenant_id].status = TenantStatus.ACTIVE
+                    rec.status = TenantStatus.ACTIVE
                     results.append({"op": action, "tenant_id": tenant_id, "status": TenantStatus.ACTIVE.value})
                 elif action == "decommission":
-                    rec = self._records[tenant_id]
-                    drain = float(op.get("drain_seconds", 60.0))
                     rec.status = TenantStatus.DRAINING
-                    rec.drain_until = now + drain
+                    rec.drain_until = now + float(drain)
                     results.append({"op": action, "tenant_id": tenant_id, "status": TenantStatus.DRAINING.value,
                                     "drain_until": rec.drain_until})
+
+            if errors:
+                # 整批放弃：暂存副本随异常丢弃，self._records 从未被触碰
+                raise TenantAdminError(errors)
+
+            # 全部通过：单次引用替换即原子提交（锁内对其他线程一次性可见）
+            self._records = stage
             return results
 
-    def _reclaim_if_full(self) -> None:
-        """容量满时回收终态（DISABLED，含过渡期满的 DRAINING）租户，保持内存有界。"""
-        if len(self._records) < self._max_tenants:
+    def _reclaim_disabled_if_full(self, records: dict[str, _TenantRecord]) -> None:
+        """容量满时在给定表上回收终态（DISABLED，含过渡期满的 DRAINING）租户，保持内存有界。"""
+        if len(records) < self._max_tenants:
             return
-        for tid in [t for t, r in self._records.items() if self._effective_status(r) is TenantStatus.DISABLED]:
-            del self._records[tid]
+        for tid in [t for t, r in records.items() if self._effective_status(r) is TenantStatus.DISABLED]:
+            del records[tid]
 
     def size(self) -> int:
         with self._lock:
